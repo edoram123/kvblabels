@@ -1,4 +1,4 @@
-import { createHmac, timingSafeEqual } from "node:crypto";
+import { createHmac, randomUUID, timingSafeEqual } from "node:crypto";
 import Fastify from "fastify";
 import pg from "pg";
 
@@ -317,12 +317,162 @@ async function listDispatchGroups() {
     });
   }
 
-  return Array.from(groups.values()).sort((left, right) =>
+  const completedGroups = Array.from(groups.values()).map((group) => {
+    const routes = [...new Set(group.orders.map((order) => order.route_code).filter(Boolean))];
+    const vehicles = [...new Set(group.orders.map((order) => order.van_number).filter(Boolean))];
+    const stops = [...new Set(group.orders.map((order) => order.stop_number).filter((value) => value != null))];
+
+    return {
+      ...group,
+      route_code: routes.length === 1 ? routes[0] : routes.length ? "MIXED" : null,
+      van_number: vehicles.length === 1 ? vehicles[0] : vehicles.length ? "MIXED" : null,
+      stop_number: stops.length === 1 ? stops[0] : null,
+      has_conflict: routes.length > 1 || vehicles.length > 1 || stops.length > 1
+    };
+  });
+
+  return completedGroups.sort((left, right) =>
     String(left.route_code || "").localeCompare(String(right.route_code || ""), undefined, { numeric: true }) ||
     String(left.van_number || "").localeCompare(String(right.van_number || ""), undefined, { numeric: true }) ||
     (left.stop_number ?? Number.MAX_SAFE_INTEGER) - (right.stop_number ?? Number.MAX_SAFE_INTEGER) ||
     left.customer_name.localeCompare(right.customer_name)
   );
+}
+
+async function queueLabelJobs(groupKeys, session) {
+  const requestedKeys = [...new Set(groupKeys.map((value) => String(value)))];
+
+  if (!requestedKeys.length || requestedKeys.length > 500) {
+    throw new Error("Select between 1 and 500 labels");
+  }
+
+  const currentGroups = await listDispatchGroups();
+  const groupsByKey = new Map(currentGroups.map((group) => [group.group_key, group]));
+  const selectedGroups = requestedKeys.map((key) => groupsByKey.get(key)).filter(Boolean);
+
+  if (selectedGroups.length !== requestedKeys.length) {
+    throw new Error("One or more selected labels are no longer available");
+  }
+
+  for (const group of selectedGroups) {
+    if (group.has_conflict) {
+      throw new Error(`${group.customer_name} has conflicting route, vehicle or stop assignments`);
+    }
+    if (!group.shipping_address || !group.postcode) {
+      throw new Error(`${group.customer_name} does not have a complete delivery address`);
+    }
+  }
+
+  const fulfillmentOrderIds = selectedGroups.flatMap((group) =>
+    group.orders.flatMap((order) => order.fulfillment_order_ids)
+  );
+  const client = await pool.connect();
+  const batchId = randomUUID();
+  let queued = 0;
+  let alreadyQueued = 0;
+
+  try {
+    await client.query("BEGIN");
+    await client.query(
+      "SELECT pg_advisory_xact_lock(hashtext('kvb_label_jobs_queue'))"
+    );
+    const existing = await client.query(
+      `SELECT DISTINCT member.fulfillment_order_id
+       FROM kvb_label_job_orders AS member
+       JOIN kvb_label_jobs AS job ON job.id = member.label_job_id
+       WHERE member.fulfillment_order_id = ANY($1::text[])
+         AND job.status IN (
+           'pending',
+           'label_generated',
+           'printed',
+           'fulfilment_queued'
+         )`,
+      [fulfillmentOrderIds]
+    );
+    const alreadyQueuedIds = new Set(
+      existing.rows.map((row) => row.fulfillment_order_id)
+    );
+    const queueableGroups = selectedGroups.filter((group) =>
+      !group.orders.some((order) =>
+        order.fulfillment_order_ids.some((id) => alreadyQueuedIds.has(id))
+      )
+    );
+    alreadyQueued = selectedGroups.length - queueableGroups.length;
+
+    for (const group of queueableGroups) {
+      const jobResult = await client.query(
+        `INSERT INTO kvb_label_jobs (
+           batch_id,
+           shop_domain,
+           customer_id,
+           customer_name,
+           shipping_name,
+           shipping_address,
+           postcode,
+           route_code,
+           van_number,
+           stop_number,
+           planned_arrival_at,
+           requested_by_shopify_user_id
+         )
+         VALUES ($1, $2, $3, $4, $5, $6, $7, $8, $9, $10, $11, $12)
+         RETURNING id`,
+        [
+          batchId,
+          session.shop,
+          group.customer_id,
+          group.customer_name,
+          group.shipping_name,
+          group.shipping_address,
+          group.postcode,
+          group.route_code,
+          group.van_number,
+          group.stop_number,
+          group.planned_arrival_at,
+          session.userId
+        ]
+      );
+      const labelJobId = jobResult.rows[0].id;
+
+      for (const order of group.orders) {
+        for (const fulfillmentOrderId of order.fulfillment_order_ids) {
+          await client.query(
+            `INSERT INTO kvb_label_job_orders (
+               label_job_id,
+               shopify_order_id,
+               shopify_order_numeric_id,
+               order_name,
+               fulfillment_order_id
+             )
+             VALUES ($1, $2, $3, $4, $5)`,
+            [
+              labelJobId,
+              order.order_id,
+              order.order_numeric_id,
+              order.order_name,
+              fulfillmentOrderId
+            ]
+          );
+        }
+      }
+
+      queued += 1;
+    }
+
+    await client.query("COMMIT");
+  } catch (error) {
+    await client.query("ROLLBACK");
+    throw error;
+  } finally {
+    client.release();
+  }
+
+  return {
+    batch_id: batchId,
+    requested: requestedKeys.length,
+    queued,
+    already_queued: alreadyQueued
+  };
 }
 
 function escapeHtml(value = "") {
@@ -446,7 +596,11 @@ app.get("/", async (_request, reply) => {
     a:hover { text-decoration: underline; }
     .orders { display: flex; gap: 6px; flex-wrap: wrap; }
     .badge { display: inline-block; padding: 3px 9px; border-radius: 999px; background: #e4f3e8; font-weight: 700; white-space: nowrap; }
+    .badge.conflict { background: #fee4e2; color: #b42318; }
     .muted { color: #616161; }
+    .queue-bar { display: flex; gap: 12px; align-items: center; padding: 14px 16px; border-bottom: 1px solid #ddd; }
+    .primary { background: #303030; border-color: #303030; color: white; }
+    .primary:hover { background: #1f1f1f; }
     .message { padding: 28px 16px; text-align: center; color: #616161; }
     .error { color: #b42318; }
   </style>
@@ -467,10 +621,18 @@ app.get("/", async (_request, reply) => {
         <select id="van-filter"><option value="">All vehicles</option></select>
         <span id="count" class="count">Loading…</span>
       </div>
+      <div class="queue-bar">
+        <span id="selected-count">0 selected</span>
+        <button id="select-filtered" type="button">Select all filtered</button>
+        <button id="clear-selection" type="button">Clear selection</button>
+        <button id="queue-labels" class="primary" type="button" disabled>Queue selected labels</button>
+        <span id="queue-message" class="muted"></span>
+      </div>
       <div class="table-wrap">
         <table>
           <thead>
             <tr>
+              <th><input id="select-visible" type="checkbox" aria-label="Select all visible labels"></th>
               <th>Customer</th>
               <th>V orders</th>
               <th>Delivery address</th>
@@ -481,7 +643,7 @@ app.get("/", async (_request, reply) => {
               <th>In Progress since</th>
             </tr>
           </thead>
-          <tbody id="rows"><tr><td colspan="8" class="message">Loading In Progress orders…</td></tr></tbody>
+          <tbody id="rows"><tr><td colspan="9" class="message">Loading In Progress orders…</td></tr></tbody>
         </table>
       </div>
     </section>
@@ -493,7 +655,14 @@ app.get("/", async (_request, reply) => {
     const vanElement = document.getElementById("van-filter");
     const countElement = document.getElementById("count");
     const refreshElement = document.getElementById("refresh");
+    const selectedCountElement = document.getElementById("selected-count");
+    const selectFilteredElement = document.getElementById("select-filtered");
+    const clearSelectionElement = document.getElementById("clear-selection");
+    const selectVisibleElement = document.getElementById("select-visible");
+    const queueLabelsElement = document.getElementById("queue-labels");
+    const queueMessageElement = document.getElementById("queue-message");
     let groups = [];
+    const selected = new Set();
 
     function html(value) {
       return String(value ?? "")
@@ -544,7 +713,8 @@ app.get("/", async (_request, reply) => {
         visible.reduce((total, group) => total + group.orders.length, 0) + " orders";
 
       if (!visible.length) {
-        rowsElement.innerHTML = '<tr><td colspan="8" class="message">No matching In Progress orders</td></tr>';
+        rowsElement.innerHTML = '<tr><td colspan="9" class="message">No matching In Progress orders</td></tr>';
+        updateSelectionState(visible);
         return;
       }
 
@@ -559,22 +729,45 @@ app.get("/", async (_request, reply) => {
           ? "—"
           : html(group.stop_number) + (group.total_stops ? " / " + html(group.total_stops) : "");
 
+        const disabled = group.has_conflict ? " disabled" : "";
+        const checked = selected.has(group.group_key) ? " checked" : "";
+        const badgeClass = group.has_conflict ? "badge conflict" : "badge";
+
         return '<tr>' +
+          '<td><input class="label-select" type="checkbox" data-group-key="' + html(group.group_key) + '"' + checked + disabled + ' aria-label="Select label for ' + html(group.customer_name) + '"></td>' +
           '<td>' + customer + (group.customer_id ? '<div class="muted">' + html(group.customer_id) + "</div>" : "") + "</td>" +
           '<td><div class="orders">' + orders + "</div></td>" +
           '<td>' + html(group.shipping_address || group.postcode || "—") + "</td>" +
-          '<td><span class="badge">' + html(group.route_code || "—") + "</span></td>" +
+          '<td><span class="' + badgeClass + '">' + html(group.route_code || "—") + "</span>" + (group.has_conflict ? '<div class="error">Resolve conflicting assignments</div>' : "") + "</td>" +
           '<td>' + html(group.van_number || "—") + "</td>" +
           '<td>' + stop + "</td>" +
           '<td>' + html(formatDate(group.planned_arrival_at)) + "</td>" +
           '<td>' + html(formatDate(group.in_progress_since)) + "</td>" +
           "</tr>";
       }).join("");
+
+      for (const checkbox of rowsElement.querySelectorAll(".label-select")) {
+        checkbox.addEventListener("change", () => {
+          if (checkbox.checked) selected.add(checkbox.dataset.groupKey);
+          else selected.delete(checkbox.dataset.groupKey);
+          updateSelectionState(visible);
+        });
+      }
+      updateSelectionState(visible);
+    }
+
+    function updateSelectionState(visible = filteredGroups()) {
+      const selectable = visible.filter((group) => !group.has_conflict);
+      const selectedVisible = selectable.filter((group) => selected.has(group.group_key));
+      selectedCountElement.textContent = selected.size + " selected";
+      queueLabelsElement.disabled = selected.size === 0;
+      selectVisibleElement.checked = selectable.length > 0 && selectedVisible.length === selectable.length;
+      selectVisibleElement.indeterminate = selectedVisible.length > 0 && selectedVisible.length < selectable.length;
     }
 
     async function load() {
       refreshElement.disabled = true;
-      rowsElement.innerHTML = '<tr><td colspan="8" class="message">Loading In Progress orders…</td></tr>';
+      rowsElement.innerHTML = '<tr><td colspan="9" class="message">Loading In Progress orders…</td></tr>';
 
       try {
         const token = await shopify.idToken();
@@ -585,14 +778,45 @@ app.get("/", async (_request, reply) => {
         if (!response.ok) throw new Error(body.error || "Unable to load orders");
 
         groups = body.groups;
+        for (const key of [...selected]) {
+          if (!groups.some((group) => group.group_key === key)) selected.delete(key);
+        }
         fillFilter(routeElement, [...new Set(groups.map((group) => group.route_code).filter(Boolean))].sort(), "routes");
         fillFilter(vanElement, [...new Set(groups.map((group) => group.van_number).filter(Boolean))].sort(), "vehicles");
         render();
       } catch (error) {
-        rowsElement.innerHTML = '<tr><td colspan="8" class="message error">' + html(error.message) + "</td></tr>";
+        rowsElement.innerHTML = '<tr><td colspan="9" class="message error">' + html(error.message) + "</td></tr>";
         countElement.textContent = "Unavailable";
       } finally {
         refreshElement.disabled = false;
+      }
+    }
+
+    async function queueSelectedLabels() {
+      queueLabelsElement.disabled = true;
+      queueMessageElement.className = "muted";
+      queueMessageElement.textContent = "Queueing…";
+
+      try {
+        const token = await shopify.idToken();
+        const response = await fetch("/api/label-jobs", {
+          method: "POST",
+          headers: {
+            Authorization: "Bearer " + token,
+            "Content-Type": "application/json"
+          },
+          body: JSON.stringify({ group_keys: [...selected] })
+        });
+        const body = await response.json();
+        if (!response.ok) throw new Error(body.error || "Unable to queue labels");
+
+        queueMessageElement.textContent = body.queued + " queued, " + body.already_queued + " already queued";
+        selected.clear();
+        render();
+      } catch (error) {
+        queueMessageElement.className = "error";
+        queueMessageElement.textContent = error.message;
+        updateSelectionState();
       }
     }
 
@@ -600,6 +824,25 @@ app.get("/", async (_request, reply) => {
     routeElement.addEventListener("change", render);
     vanElement.addEventListener("change", render);
     refreshElement.addEventListener("click", load);
+    selectFilteredElement.addEventListener("click", () => {
+      for (const group of filteredGroups()) {
+        if (!group.has_conflict) selected.add(group.group_key);
+      }
+      render();
+    });
+    clearSelectionElement.addEventListener("click", () => {
+      selected.clear();
+      render();
+    });
+    selectVisibleElement.addEventListener("change", () => {
+      for (const group of filteredGroups()) {
+        if (group.has_conflict) continue;
+        if (selectVisibleElement.checked) selected.add(group.group_key);
+        else selected.delete(group.group_key);
+      }
+      render();
+    });
+    queueLabelsElement.addEventListener("click", queueSelectedLabels);
     load();
   </script>
 </body>
@@ -648,6 +891,29 @@ app.get(
       request.log.error({ error }, "Unable to load dispatch labels");
       return reply.code(500).send({
         error: error.message || "Unable to load dispatch labels"
+      });
+    }
+  }
+);
+
+app.post(
+  "/api/label-jobs",
+  { preHandler: requireShopifySession },
+  async (request, reply) => {
+    try {
+      if (!Array.isArray(request.body?.group_keys)) {
+        return reply.code(400).send({ error: "group_keys must be an array" });
+      }
+
+      const result = await queueLabelJobs(
+        request.body.group_keys,
+        request.shopifySession
+      );
+      return { ok: true, ...result };
+    } catch (error) {
+      request.log.error({ error }, "Unable to queue label jobs");
+      return reply.code(400).send({
+        error: error.message || "Unable to queue label jobs"
       });
     }
   }
